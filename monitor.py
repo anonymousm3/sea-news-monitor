@@ -10,6 +10,23 @@ URL = "https://sea-news.combocabal.com/"
 STATE_FILE = Path("state.json")
 TIMEOUT = 20
 
+BLOCKED_TITLES = {
+    "home",
+    "news",
+    "event",
+    "download",
+    "reward",
+    "top-up",
+    "top up",
+    "login",
+    "register",
+    "en",
+    "id",
+    "en id",
+    "please follow new news coming soon.",
+    "please follow new news coming soon",
+}
+
 
 def fetch_page():
     headers = {
@@ -27,11 +44,30 @@ def clean_text(text: str) -> str:
 def looks_like_date(text: str) -> bool:
     text = clean_text(text)
     patterns = [
-        r"\b\d{2}-\d{2}-\d{4}\b",
-        r"\b\d{4}-\d{2}-\d{2}\b",
-        r"\b\d{2}/\d{2}/\d{4}\b",
+        r"\b\d{2}-\d{2}-\d{4}\b",   # 19-03-2026
+        r"\b\d{4}-\d{2}-\d{2}\b",   # 2026-03-19
+        r"\b\d{2}/\d{2}/\d{4}\b",   # 19/03/2026
     ]
     return any(re.search(p, text) for p in patterns)
+
+
+def looks_like_real_title(text: str) -> bool:
+    t = clean_text(text)
+    if not t:
+        return False
+
+    low = t.lower()
+
+    if low in BLOCKED_TITLES:
+        return False
+
+    if looks_like_date(t):
+        return False
+
+    if len(t) < 6:
+        return False
+
+    return True
 
 
 def extract_news_items(html: str):
@@ -42,49 +78,54 @@ def extract_news_items(html: str):
 
     items = []
 
-    containers = soup.select("article, .news, .post, .entry, .article, .item, li, .card, main div")
+    # First pass: look for containers that include a date
+    candidate_containers = soup.find_all(["article", "div", "li", "section"])
 
-    for container in containers:
-        texts = [
-            clean_text(t.get_text(" ", strip=True))
-            for t in container.find_all(["h1", "h2", "h3", "h4", "p", "span", "a", "div"])
-        ]
-        texts = [t for t in texts if t and t.lower() != "please follow new news coming soon."]
-
-        if not texts:
+    for container in candidate_containers:
+        container_text = clean_text(container.get_text(" ", strip=True))
+        if not container_text:
             continue
 
-        date_text = None
+        if "please follow new news coming soon" in container_text.lower():
+            continue
+
+        date_match = re.search(r"\b\d{2}-\d{2}-\d{4}\b|\b\d{4}-\d{2}-\d{2}\b|\b\d{2}/\d{2}/\d{4}\b", container_text)
+        if not date_match:
+            continue
+
+        date_text = date_match.group(0)
+
         title_text = None
 
-        for t in texts:
-            if looks_like_date(t):
-                date_text = t
+        # Prefer headings / anchors inside the same container
+        for el in container.find_all(["h1", "h2", "h3", "h4", "a", "p", "span"], recursive=True):
+            text = clean_text(el.get_text(" ", strip=True))
+            if looks_like_real_title(text):
+                title_text = text
                 break
 
-        for t in texts:
-            if not looks_like_date(t) and len(t) >= 4:
-                title_text = t
-                break
+        if not title_text:
+            # Fallback: split lines and find first good non-date text
+            parts = [clean_text(x) for x in re.split(r"[\n\r]+", container.get_text("\n", strip=True))]
+            for part in parts:
+                if looks_like_real_title(part):
+                    title_text = part
+                    break
 
-        if date_text or title_text:
-            key = f"{date_text or ''} | {title_text or ''}".strip()
-            items.append({
-                "date": date_text or "",
-                "title": title_text or "",
-                "key": key
-            })
+        key = f"{date_text} | {title_text or ''}".strip()
+        items.append({
+            "date": date_text,
+            "title": title_text or "",
+            "key": key
+        })
 
+    # Deduplicate
     seen = set()
     filtered = []
 
     for item in items:
         key = item["key"]
-        if key in seen:
-            continue
-        if key == "|" or key == "":
-            continue
-        if item["title"].lower() == "please follow new news coming soon.":
+        if not key or key in seen:
             continue
         seen.add(key)
         filtered.append(item)
@@ -120,20 +161,12 @@ def main():
     old_keys = {item["key"] for item in old_state.get("items", [])}
     new_items = [item for item in current_items if item["key"] not in old_keys]
 
-    if not STATE_FILE.exists():
-        save_state({"items": current_items})
-        print("Initial snapshot saved. No notification sent.")
-        print(current_items)
-        return
-
     if new_items:
         lines = []
         for item in new_items:
-            if item["date"] and item["title"]:
+            if item["title"]:
                 lines.append(f"• {item['date']} — {item['title']}")
-            elif item["title"]:
-                lines.append(f"• {item['title']}")
-            elif item["date"]:
+            else:
                 lines.append(f"• {item['date']}")
 
         msg = (
@@ -147,6 +180,7 @@ def main():
         print("No new updates detected.")
 
     save_state({"items": current_items})
+    print(json.dumps({"items": current_items}, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
